@@ -20,7 +20,7 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-st.set_page_config(page_title="Kahani Comic Maker", page_icon="📖", layout="wide")
+st.set_page_config(page_title="Myra Comics", page_icon="📖", layout="wide")
 
 # ---------------- Settings (from Streamlit secrets) ----------------
 API_KEY = st.secrets.get("GEMINI_API_KEY", "")
@@ -72,7 +72,7 @@ STORY_FORMAT = """{
 
 # ---------------- Password gate ----------------
 if APP_PASSWORD and not st.session_state.get("unlocked"):
-    st.title("📖 Kahani Comic Maker")
+    st.title("📖 Myra Comics")
     pw = st.text_input("Family password", type="password")
     if st.button("Enter"):
         if pw == APP_PASSWORD:
@@ -245,7 +245,7 @@ def go_home():
 def story_file() -> str:
     return json.dumps(
         {
-            "app": "kahani-comic",
+            "app": "myra-comics",
             "version": 1,
             "idea": ss.get("idea", ""),
             "story": ss.story,
