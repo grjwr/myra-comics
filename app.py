@@ -27,6 +27,8 @@ st.set_page_config(page_title="Myra Comics", page_icon="📖", layout="wide")
 API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 TEXT_MODEL = st.secrets.get("TEXT_MODEL", "gemini-3.6-flash")
+# Other free models to try if the main one is busy (503) or its free daily limit is used up (429)
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 IMAGE_MODEL = st.secrets.get("IMAGE_MODEL", "gemini-3.1-flash-image")  # only used if IMAGE_PROVIDER = "gemini" (paid)
 # Free pictures: Cloudflare Workers AI (10,000 free neurons/day, no card needed)
 CF_ACCOUNT_ID = st.secrets.get("CF_ACCOUNT_ID", "")
@@ -110,16 +112,50 @@ def parse_json(text: str) -> dict:
     return json.loads(text)
 
 
-def ask_json(prompt, extra_parts=None) -> dict:
-    contents = (extra_parts or []) + [prompt]
-    resp = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM, response_mime_type="application/json"
-        ),
+def _is_temporary(e: Exception) -> bool:
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    text = str(e)
+    return code in (429, 500, 503, 504) or any(
+        k in text for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand")
     )
-    return parse_json(resp.text)
+
+
+def _is_model_missing(e: Exception) -> bool:
+    return getattr(e, "code", None) == 404 or "NOT_FOUND" in str(e)
+
+
+def ask_json(prompt, extra_parts=None) -> dict:
+    """Ask Gemini for JSON. If a model is busy or out of free quota, try the other free models."""
+    contents = (extra_parts or []) + [prompt]
+    models = [TEXT_MODEL] + [m for m in FALLBACK_MODELS if m != TEXT_MODEL]
+    last_error = None
+    for model in models:
+        for attempt in range(2):
+            if attempt:
+                time.sleep(3)
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM, response_mime_type="application/json"
+                    ),
+                )
+                return parse_json(resp.text)
+            except json.JSONDecodeError as e:
+                last_error = e
+            except Exception as e:
+                last_error = e
+                if _is_model_missing(e):
+                    break
+                if not _is_temporary(e):
+                    raise
+                if "RESOURCE_EXHAUSTED" in str(e) or getattr(e, "code", None) == 429:
+                    break   # this model's free limit is used up: go straight to the next model
+    raise RuntimeError(
+        "Google's free AI is busy or today's free limit is used up on all models. "
+        f"Please try again later. (Last error: {last_error})"
+    )
 
 
 def transcribe(audio_bytes: bytes, mime: str) -> str:
@@ -571,6 +607,13 @@ if ss.mode is None:
 # ----- Sidebar (all modes) -----
 with st.sidebar:
     st.button("🏠 Back to start", on_click=go_home, use_container_width=True)
+    if st.button("🔍 Test voice/story AI (Google)", use_container_width=True):
+        with st.spinner("Asking Google Gemini..."):
+            try:
+                ask_json('Return JSON: {"ok": "yes"}')
+                st.success("✅ Google Gemini is working!")
+            except Exception as e:
+                st.error(str(e))
     if st.button("🔍 Test picture drawing", use_container_width=True):
         with st.spinner("Asking Cloudflare for a test picture..."):
             try:
