@@ -9,6 +9,8 @@ import hashlib
 import io
 import json
 import re
+import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -157,13 +159,56 @@ def ask_json(prompt, extra_parts=None) -> dict:
     ) from last_error
 
 
+AUDIO_MIME = {
+    "wav": "audio/wav", "mp3": "audio/mp3", "aac": "audio/aac", "ogg": "audio/ogg",
+    "oga": "audio/ogg", "opus": "audio/ogg", "flac": "audio/flac", "aiff": "audio/aiff",
+    "m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm", "amr": "audio/amr", "3gp": "audio/3gpp",
+}
+MAX_AUDIO_BYTES = 18 * 1024 * 1024  # Gemini accepts up to ~20 MB of audio in one request
+
+
+def to_wav(audio_bytes: bytes):
+    """Convert any recording (phone voice notes, m4a, opus, ...) to small 16 kHz mono WAV.
+    Returns (bytes, mime). If ffmpeg is missing or fails, returns None."""
+    if not shutil.which("ffmpeg"):
+        return None
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+             "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"],
+            input=audio_bytes, capture_output=True, timeout=120, check=True,
+        ).stdout
+        return (out, "audio/wav") if len(out) > 1000 else None
+    except Exception:
+        return None
+
+
+def prepare_audio(audio_bytes: bytes, name: str, mime: str):
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if not (mime or "").startswith("audio/"):
+        mime = AUDIO_MIME.get(ext, "audio/wav")
+    if mime != "audio/wav" or len(audio_bytes) > MAX_AUDIO_BYTES:
+        converted = to_wav(audio_bytes)
+        if converted:
+            audio_bytes, mime = converted
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise RuntimeError("This recording is too long. Please keep it under about 8 minutes.")
+    if len(audio_bytes) < 2000:
+        raise RuntimeError("The recording is empty. Press the mic, speak, then press it again to stop.")
+    return audio_bytes, mime
+
+
 def transcribe(audio_bytes: bytes, mime: str) -> str:
     prompt = (
         "Listen to this child speaking. Write down exactly what she says. "
         "Hindi words go in Devanagari script, English words in English. "
-        "Only fix obvious mishearings. Return JSON: {\"transcript\": \"...\"}"
+        "Only fix obvious mishearings. If you cannot hear any words, return an empty transcript. "
+        "Return JSON: {\"transcript\": \"...\"}"
     )
-    return ask_json(prompt, [types.Part.from_bytes(data=audio_bytes, mime_type=mime)])["transcript"]
+    text = ask_json(prompt, [types.Part.from_bytes(data=audio_bytes, mime_type=mime)]).get("transcript", "")
+    if not text.strip():
+        raise RuntimeError("I couldn't hear any words. Please speak a little louder and closer to the phone.")
+    return text
 
 
 def write_story(idea: str, n_panels: int) -> dict:
@@ -520,19 +565,36 @@ def show_comic_section(step_label: str):
 
 
 def voice_box(audio_label: str, audio_key: str, text_key: str, text_label: str):
-    audio = st.audio_input(audio_label, key=audio_key)
+    tab_rec, tab_up = st.tabs(["🎤 Record now", "📁 Upload a recording"])
+    with tab_rec:
+        recorded = st.audio_input(audio_label, key=audio_key)
+    with tab_up:
+        uploaded = st.file_uploader(
+            "Choose a voice recording (voice note from your phone: m4a, mp3, wav, ogg, opus, aac...)",
+            type=list(AUDIO_MIME.keys()), key=f"{audio_key}_file",
+        )
+
+    audio = uploaded or recorded  # an uploaded file wins if both are there
     if audio is not None:
-        st.success("✅ Got your recording! Listen to it here, then press the button below.")
+        size_kb = len(audio.getvalue()) // 1024
+        source = "uploaded file" if uploaded else "recording"
+        st.success(f"✅ Got your {source} ({size_kb} KB). Listen to it here, then press the button below.")
         st.audio(audio.getvalue(), format=audio.type or "audio/wav")
     else:
-        st.caption("🎤 No recording yet. Press the mic, speak, then press it again to stop.")
+        st.caption("🎤 No recording yet. Record with the mic (press it again to stop), or upload a voice note.")
+
     if st.button("✍️ Turn my voice into words (Hindi / English / mix)", key=f"tr_{audio_key}",
                  type="primary", disabled=audio is None):
         with st.spinner("Listening carefully..."):
             try:
-                ss[text_key] = transcribe(audio.getvalue(), audio.type or "audio/wav")
+                data, mime = prepare_audio(audio.getvalue(), getattr(audio, "name", "") or "", audio.type)
+                ss[text_key] = transcribe(data, mime)
+                st.success("Done! Check the words below and fix anything that's wrong.")
             except Exception as e:
-                st.error(f"Could not understand the recording. Please try again. ({e})")
+                st.error(f"Could not turn the recording into words. {e}")
+                with st.expander("Technical details (for fixing problems)"):
+                    st.code(f"{type(e).__name__}: {e}\nmime={audio.type}, name={getattr(audio, 'name', '')}, "
+                            f"size={len(audio.getvalue())} bytes, model={TEXT_MODEL}")
     st.text_area(text_label, key=text_key, height=150)
 
 
