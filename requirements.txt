@@ -1,0 +1,6 @@
+streamlit>=1.40
+google-genai>=1.30
+fpdf2>=2.8
+uharfbuzz
+pillow
+requests
