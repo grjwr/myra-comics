@@ -521,7 +521,13 @@ def show_comic_section(step_label: str):
 
 def voice_box(audio_label: str, audio_key: str, text_key: str, text_label: str):
     audio = st.audio_input(audio_label, key=audio_key)
-    if audio is not None and st.button("✍️ Turn my voice into words", key=f"tr_{audio_key}"):
+    if audio is not None:
+        st.success("✅ Got your recording! Listen to it here, then press the button below.")
+        st.audio(audio.getvalue(), format=audio.type or "audio/wav")
+    else:
+        st.caption("🎤 No recording yet. Press the mic, speak, then press it again to stop.")
+    if st.button("✍️ Turn my voice into words (Hindi / English / mix)", key=f"tr_{audio_key}",
+                 type="primary", disabled=audio is None):
         with st.spinner("Listening carefully..."):
             try:
                 ss[text_key] = transcribe(audio.getvalue(), audio.type or "audio/wav")
