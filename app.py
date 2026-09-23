@@ -21,7 +21,7 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-st.set_page_config(page_title="Kahani Comic Maker", page_icon="📖", layout="wide")
+st.set_page_config(page_title="Myra Comics", page_icon="📖", layout="wide")
 
 # ---------------- Settings (from Streamlit secrets) ----------------
 API_KEY = st.secrets.get("GEMINI_API_KEY", "")
