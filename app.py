@@ -9,8 +9,6 @@ import hashlib
 import io
 import json
 import re
-import shutil
-import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -29,14 +27,12 @@ st.set_page_config(page_title="Myra Comics", page_icon="📖", layout="wide")
 API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 TEXT_MODEL = st.secrets.get("TEXT_MODEL", "gemini-3.6-flash")
-# Other free models to try if the main one is busy (503) or rate-limited (429)
-FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 IMAGE_MODEL = st.secrets.get("IMAGE_MODEL", "gemini-3.1-flash-image")  # only used if IMAGE_PROVIDER = "gemini" (paid)
 # Free pictures: Cloudflare Workers AI (10,000 free neurons/day, no card needed)
 CF_ACCOUNT_ID = st.secrets.get("CF_ACCOUNT_ID", "")
 CF_API_TOKEN = st.secrets.get("CF_API_TOKEN", "")
 CF_IMAGE_MODEL = st.secrets.get("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
-IMAGE_PROVIDER = st.secrets.get("IMAGE_PROVIDER", "cloudflare" if CF_ACCOUNT_ID and CF_API_TOKEN else "gemini")
+IMAGE_PROVIDER = st.secrets.get("IMAGE_PROVIDER", "cloudflare")
 # Optional: share links (Supabase Storage). Leave these out and the app still works, just without links.
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
@@ -114,101 +110,25 @@ def parse_json(text: str) -> dict:
     return json.loads(text)
 
 
-def _is_temporary(e: Exception) -> bool:
-    code = getattr(e, "code", None) or getattr(e, "status_code", None)
-    text = str(e)
-    return code in (429, 500, 503, 504) or any(
-        k in text for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand")
-    )
-
-
-def _is_model_missing(e: Exception) -> bool:
-    code = getattr(e, "code", None)
-    return code == 404 or "NOT_FOUND" in str(e)
-
-
 def ask_json(prompt, extra_parts=None) -> dict:
-    """Ask Gemini for JSON. Retries busy models, then falls back to other free models."""
     contents = (extra_parts or []) + [prompt]
-    models = [TEXT_MODEL] + [m for m in FALLBACK_MODELS if m != TEXT_MODEL]
-    last_error = None
-    for model in models:
-        for attempt in range(3):  # waits 0s, 3s, 6s
-            if attempt:
-                time.sleep(3 * attempt)
-            try:
-                resp = client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM, response_mime_type="application/json"
-                    ),
-                )
-                return parse_json(resp.text)
-            except json.JSONDecodeError as e:   # garbled answer: just ask again
-                last_error = e
-            except Exception as e:
-                last_error = e
-                if _is_model_missing(e):
-                    break                        # this model name doesn't exist: try the next model
-                if not _is_temporary(e):
-                    raise                        # real error (e.g. wrong API key): show it
-        # this model stayed busy: move on to the next free model
-    raise RuntimeError(
-        "Google's AI is very busy right now. Please wait a minute and press the button again."
-    ) from last_error
-
-
-AUDIO_MIME = {
-    "wav": "audio/wav", "mp3": "audio/mp3", "aac": "audio/aac", "ogg": "audio/ogg",
-    "oga": "audio/ogg", "opus": "audio/ogg", "flac": "audio/flac", "aiff": "audio/aiff",
-    "m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm", "amr": "audio/amr", "3gp": "audio/3gpp",
-}
-MAX_AUDIO_BYTES = 18 * 1024 * 1024  # Gemini accepts up to ~20 MB of audio in one request
-
-
-def to_wav(audio_bytes: bytes):
-    """Convert any recording (phone voice notes, m4a, opus, ...) to small 16 kHz mono WAV.
-    Returns (bytes, mime). If ffmpeg is missing or fails, returns None."""
-    if not shutil.which("ffmpeg"):
-        return None
-    try:
-        out = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-             "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"],
-            input=audio_bytes, capture_output=True, timeout=120, check=True,
-        ).stdout
-        return (out, "audio/wav") if len(out) > 1000 else None
-    except Exception:
-        return None
-
-
-def prepare_audio(audio_bytes: bytes, name: str, mime: str):
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    if not (mime or "").startswith("audio/"):
-        mime = AUDIO_MIME.get(ext, "audio/wav")
-    if mime != "audio/wav" or len(audio_bytes) > MAX_AUDIO_BYTES:
-        converted = to_wav(audio_bytes)
-        if converted:
-            audio_bytes, mime = converted
-    if len(audio_bytes) > MAX_AUDIO_BYTES:
-        raise RuntimeError("This recording is too long. Please keep it under about 8 minutes.")
-    if len(audio_bytes) < 2000:
-        raise RuntimeError("The recording is empty. Press the mic, speak, then press it again to stop.")
-    return audio_bytes, mime
+    resp = client.models.generate_content(
+        model=TEXT_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM, response_mime_type="application/json"
+        ),
+    )
+    return parse_json(resp.text)
 
 
 def transcribe(audio_bytes: bytes, mime: str) -> str:
     prompt = (
         "Listen to this child speaking. Write down exactly what she says. "
         "Hindi words go in Devanagari script, English words in English. "
-        "Only fix obvious mishearings. If you cannot hear any words, return an empty transcript. "
-        "Return JSON: {\"transcript\": \"...\"}"
+        "Only fix obvious mishearings. Return JSON: {\"transcript\": \"...\"}"
     )
-    text = ask_json(prompt, [types.Part.from_bytes(data=audio_bytes, mime_type=mime)]).get("transcript", "")
-    if not text.strip():
-        raise RuntimeError("I couldn't hear any words. Please speak a little louder and closer to the phone.")
-    return text
+    return ask_json(prompt, [types.Part.from_bytes(data=audio_bytes, mime_type=mime)])["transcript"]
 
 
 def write_story(idea: str, n_panels: int) -> dict:
@@ -246,21 +166,60 @@ def extract_image(resp):
     return None
 
 
-def draw_panel_cloudflare(prompt: str):
-    r = requests.post(
-        f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMAGE_MODEL}",
-        headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
-        json={"prompt": prompt[:2000], "steps": 8},
-        timeout=120,
-    )
-    if r.status_code == 429 or "limit" in r.text.lower() and r.status_code >= 400:
-        raise RuntimeError("Today's free pictures are used up. Try again tomorrow (resets 5:30 AM India time).")
-    r.raise_for_status()
-    data = r.json()
-    img_b64 = (data.get("result") or {}).get("image")
-    if not img_b64:
-        raise RuntimeError(f"No picture returned: {data.get('errors')}")
-    return base64.b64decode(img_b64), "image/jpeg"
+def _cf_errors(r) -> str:
+    try:
+        errs = r.json().get("errors") or []
+        return "; ".join(f"{e.get('code')}: {e.get('message')}" for e in errs) or r.text[:300]
+    except Exception:
+        return r.text[:300]
+
+
+def draw_panel_cloudflare(prompt: str, simple_prompt: str):
+    if not (CF_ACCOUNT_ID and CF_API_TOKEN):
+        raise RuntimeError(
+            "Cloudflare keys are missing. In Streamlit → Settings → Secrets add "
+            "CF_ACCOUNT_ID and CF_API_TOKEN (spelled exactly like that)."
+        )
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID.strip()}/ai/run/{CF_IMAGE_MODEL}"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN.strip()}"}
+    last = ""
+    for attempt in range(4):
+        text = prompt if attempt < 2 else simple_prompt   # later tries use a shorter, simpler prompt
+        if attempt:
+            time.sleep(2 * attempt)
+        try:
+            r = requests.post(url, headers=headers, json={"prompt": text[:2000], "steps": 8}, timeout=120)
+        except requests.RequestException as e:
+            last = f"network problem: {e}"
+            continue
+        if r.ok:
+            try:
+                img_b64 = (r.json().get("result") or {}).get("image")
+            except ValueError:
+                img_b64 = None
+            if img_b64:
+                return base64.b64decode(img_b64), "image/jpeg"
+            last = f"no picture in reply: {_cf_errors(r)}"
+            continue
+        err = _cf_errors(r)
+        low = err.lower()
+        if r.status_code in (401, 403) or "authentication" in low or "10000" in low:
+            raise RuntimeError(
+                "Cloudflare did not accept the API token. Create a new token with the "
+                f"'Workers AI' template and put it in CF_API_TOKEN. (Cloudflare said: {err})"
+            )
+        if r.status_code == 404 or "could not route" in low or "7003" in low:
+            raise RuntimeError(
+                "Cloudflare could not find your account or the picture model. Check CF_ACCOUNT_ID "
+                f"(32 letters/numbers from the dashboard). (Cloudflare said: {err})"
+            )
+        if r.status_code == 429 or "neuron" in low or "daily" in low:
+            raise RuntimeError(
+                "Today's free pictures are used up. Try again tomorrow (resets 5:30 AM India time). "
+                f"(Cloudflare said: {err})"
+            )
+        last = f"HTTP {r.status_code}: {err}"   # busy / safety filter / other: try again
+    raise RuntimeError(f"Cloudflare could not draw this picture after 4 tries. ({last})")
 
 
 def draw_panel(story: dict, panel: dict, reference=None):
@@ -270,7 +229,8 @@ def draw_panel(story: dict, panel: dict, reference=None):
         f"Scene to draw: {panel['scene']}"
     )
     if IMAGE_PROVIDER == "cloudflare":
-        return draw_panel_cloudflare(prompt)
+        simple = f"{STYLE}\n\nScene: {panel['scene']}"
+        return draw_panel_cloudflare(prompt, simple)
     contents = [prompt]
     if reference:
         contents.append(types.Part.from_bytes(data=reference[0], mime_type=reference[1]))
@@ -308,13 +268,16 @@ def draw_pictures(only_missing: bool):
     if not todo:
         st.info("All pictures are already drawn! Use 🔁 Redraw under a picture to change it.")
         return
+    ss.draw_errors = []
     bar = st.progress(0.0, text="Drawing...")
     for n, i in enumerate(todo):
         bar.progress(n / len(todo), text=f"Drawing picture {i + 1} ({n + 1} of {len(todo)})...")
         try:
             ss.images[i] = draw_panel(story, story["panels"][i], reference_for(i))
         except Exception as e:
-            st.warning(f"Picture {i + 1} failed ({e}). You can redraw it below.")
+            ss.draw_errors.append(f"Picture {i + 1}: {e}")
+            if "missing" in str(e) or "token" in str(e) or "used up" in str(e) or "account" in str(e):
+                break   # same problem for every picture: stop early
     bar.progress(1.0, text="Done! 🎉")
 
 
@@ -538,6 +501,9 @@ def show_comic_section(step_label: str):
             draw_pictures(only_missing=False)
             st.rerun()
 
+    if ss.get("draw_errors"):
+        st.error("Some pictures could not be drawn:\n\n" + "\n\n".join(ss.draw_errors))
+
     cols = st.columns(2)
     for i, panel in enumerate(story["panels"]):
         with cols[i % 2]:
@@ -555,9 +521,10 @@ def show_comic_section(step_label: str):
                 with st.spinner(f"Redrawing picture {i + 1}..."):
                     try:
                         ss.images[i] = draw_panel(story, panel, reference_for(i))
+                        ss.draw_errors = []
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Redraw failed ({e})")
+                        st.error(f"Redraw failed: {e}")
             st.divider()
 
     if any(ss.images):
@@ -565,36 +532,13 @@ def show_comic_section(step_label: str):
 
 
 def voice_box(audio_label: str, audio_key: str, text_key: str, text_label: str):
-    tab_rec, tab_up = st.tabs(["🎤 Record now", "📁 Upload a recording"])
-    with tab_rec:
-        recorded = st.audio_input(audio_label, key=audio_key)
-    with tab_up:
-        uploaded = st.file_uploader(
-            "Choose a voice recording (voice note from your phone: m4a, mp3, wav, ogg, opus, aac...)",
-            type=list(AUDIO_MIME.keys()), key=f"{audio_key}_file",
-        )
-
-    audio = uploaded or recorded  # an uploaded file wins if both are there
-    if audio is not None:
-        size_kb = len(audio.getvalue()) // 1024
-        source = "uploaded file" if uploaded else "recording"
-        st.success(f"✅ Got your {source} ({size_kb} KB). Listen to it here, then press the button below.")
-        st.audio(audio.getvalue(), format=audio.type or "audio/wav")
-    else:
-        st.caption("🎤 No recording yet. Record with the mic (press it again to stop), or upload a voice note.")
-
-    if st.button("✍️ Turn my voice into words (Hindi / English / mix)", key=f"tr_{audio_key}",
-                 type="primary", disabled=audio is None):
+    audio = st.audio_input(audio_label, key=audio_key)
+    if audio is not None and st.button("✍️ Turn my voice into words", key=f"tr_{audio_key}"):
         with st.spinner("Listening carefully..."):
             try:
-                data, mime = prepare_audio(audio.getvalue(), getattr(audio, "name", "") or "", audio.type)
-                ss[text_key] = transcribe(data, mime)
-                st.success("Done! Check the words below and fix anything that's wrong.")
+                ss[text_key] = transcribe(audio.getvalue(), audio.type or "audio/wav")
             except Exception as e:
-                st.error(f"Could not turn the recording into words. {e}")
-                with st.expander("Technical details (for fixing problems)"):
-                    st.code(f"{type(e).__name__}: {e}\nmime={audio.type}, name={getattr(audio, 'name', '')}, "
-                            f"size={len(audio.getvalue())} bytes, model={TEXT_MODEL}")
+                st.error(f"Could not understand the recording. Please try again. ({e})")
     st.text_area(text_label, key=text_key, height=150)
 
 
@@ -627,6 +571,15 @@ if ss.mode is None:
 # ----- Sidebar (all modes) -----
 with st.sidebar:
     st.button("🏠 Back to start", on_click=go_home, use_container_width=True)
+    if st.button("🔍 Test picture drawing", use_container_width=True):
+        with st.spinner("Asking Cloudflare for a test picture..."):
+            try:
+                img = draw_panel_cloudflare(f"{STYLE}\n\nScene: a happy yellow duck in a pond",
+                                            "a happy yellow cartoon duck")
+                st.success("✅ Picture drawing works!")
+                st.image(img[0])
+            except Exception as e:
+                st.error(str(e))
     if ss.story:
         st.caption("Save your story first if you want to come back to it later!")
         save_button("sidebar")
