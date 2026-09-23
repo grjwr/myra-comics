@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import re
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import quote
@@ -26,6 +27,8 @@ st.set_page_config(page_title="Kahani Comic Maker", page_icon="📖", layout="wi
 API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 TEXT_MODEL = st.secrets.get("TEXT_MODEL", "gemini-3.6-flash")
+# Other free models to try if the main one is busy (503) or rate-limited (429)
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 IMAGE_MODEL = st.secrets.get("IMAGE_MODEL", "gemini-3.1-flash-image")  # only used if IMAGE_PROVIDER = "gemini" (paid)
 # Free pictures: Cloudflare Workers AI (10,000 free neurons/day, no card needed)
 CF_ACCOUNT_ID = st.secrets.get("CF_ACCOUNT_ID", "")
@@ -109,16 +112,49 @@ def parse_json(text: str) -> dict:
     return json.loads(text)
 
 
-def ask_json(prompt, extra_parts=None) -> dict:
-    contents = (extra_parts or []) + [prompt]
-    resp = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM, response_mime_type="application/json"
-        ),
+def _is_temporary(e: Exception) -> bool:
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    text = str(e)
+    return code in (429, 500, 503, 504) or any(
+        k in text for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand")
     )
-    return parse_json(resp.text)
+
+
+def _is_model_missing(e: Exception) -> bool:
+    code = getattr(e, "code", None)
+    return code == 404 or "NOT_FOUND" in str(e)
+
+
+def ask_json(prompt, extra_parts=None) -> dict:
+    """Ask Gemini for JSON. Retries busy models, then falls back to other free models."""
+    contents = (extra_parts or []) + [prompt]
+    models = [TEXT_MODEL] + [m for m in FALLBACK_MODELS if m != TEXT_MODEL]
+    last_error = None
+    for model in models:
+        for attempt in range(3):  # waits 0s, 3s, 6s
+            if attempt:
+                time.sleep(3 * attempt)
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM, response_mime_type="application/json"
+                    ),
+                )
+                return parse_json(resp.text)
+            except json.JSONDecodeError as e:   # garbled answer: just ask again
+                last_error = e
+            except Exception as e:
+                last_error = e
+                if _is_model_missing(e):
+                    break                        # this model name doesn't exist: try the next model
+                if not _is_temporary(e):
+                    raise                        # real error (e.g. wrong API key): show it
+        # this model stayed busy: move on to the next free model
+    raise RuntimeError(
+        "Google's AI is very busy right now. Please wait a minute and press the button again."
+    ) from last_error
 
 
 def transcribe(audio_bytes: bytes, mime: str) -> str:
