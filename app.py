@@ -1,5 +1,5 @@
 """
-Kahani Comic Maker
+Myra Comics
 Speak a story (Hindi / English / Hinglish) -> story in English + Hindi -> colourful comic book.
 Start a new story, or open a saved story file and change it.
 Uses Google Gemini for speech understanding, story writing and panel drawing.
@@ -75,7 +75,7 @@ STORY_FORMAT = """{
 
 # ---------------- Password gate ----------------
 if APP_PASSWORD and not st.session_state.get("unlocked"):
-    st.title("📖 Kahani Comic Maker")
+    st.title("📖 Myra Comics")
     pw = st.text_input("Family password", type="password")
     if st.button("Enter"):
         if pw == APP_PASSWORD:
@@ -531,7 +531,7 @@ def voice_box(audio_label: str, audio_key: str, text_key: str, text_label: str):
 
 
 # ---------------- UI ----------------
-st.title("📖 Kahani Comic Maker")
+st.title("📖 Myra Comics")
 
 # ----- Start screen -----
 if ss.mode is None:
